@@ -100,6 +100,19 @@ const callApi = async (api, parameters) => {
   return response.data;
 };
 
+const callRestApi = async (path, token, params = {}) => {
+  const url = new URL(`https://api.todoist.com/api/v1/${path}`);
+  Object.entries(params).forEach(([key, val]) => {
+    if (val !== null && val !== undefined) url.searchParams.set(key, val);
+  });
+  const response = await axios({
+    method: "get",
+    headers: { Authorization: "Bearer " + token },
+    url: url.toString(),
+  });
+  return response.data;
+};
+
 const renderErrorPage = (res, message, error) => {
   logger.error((error && error.message ? error.message : error) || message);
   res.status((error && error.status) || 500);
@@ -180,16 +193,13 @@ const convertUserNames = (syncData) => {
   }));
 };
 
-const fetchCompleted = async function (token, offset = 0) {
+const fetchCompleted = async function (token, cursor = null) {
   let page;
   try {
-    page = await callApi("tasks/completed", {
-      token: token,
-      limit: COMPL_MAX_PAGE_SIZE,
-      offset: offset,
-      annotate_notes: true,
-      annotate_items: true,
-    });
+    const params = { limit: COMPL_MAX_PAGE_SIZE };
+    if (cursor) params.cursor = cursor;
+
+    page = await callRestApi("tasks/completed", token, params);
   } catch (error) {
     if (error.response) {
       logger.error({
@@ -201,19 +211,16 @@ const fetchCompleted = async function (token, offset = 0) {
     } else {
       logger.error(error);
     }
-
-    // Independent of the error, we return a fallback so the overall export doesn't fail.
-    return { items: [], projects: [], sections: [] };
+    return { results: [] };
   }
-  if (page.items.length > 0) {
-    const remainder = await fetchCompleted(token, offset + COMPL_MAX_PAGE_SIZE);
+
+  if (page.next_cursor) {
+    const remainder = await fetchCompleted(token, page.next_cursor);
     return {
-      items: page.items.concat(remainder.items),
-      projects: Object.assign({}, page.projects, remainder.projects),
-      sections: Object.assign({}, page.sections, remainder.sections),
+      results: (page.results || []).concat(remainder.results),
     };
   } else {
-    return page;
+    return { results: page.results || [] };
   }
 };
 
@@ -237,7 +244,10 @@ const exportData = async (res, token, format = "csv") => {
       );
     }
     format = format.replace(FORMAT_SUFFIX_INCLUDE_ARCHIVED, "");
-    syncData.completed = await fetchCompleted(token);
+    const completedData = await fetchCompleted(token);
+    // Merge completed tasks into items so they appear in CSV and JSON exports
+    syncData.completed = completedData; // keep for JSON export
+    syncData.items = syncData.items.concat(completedData.results || []);
   }
 
   if (format === "json") {
