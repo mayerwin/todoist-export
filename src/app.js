@@ -97,7 +97,13 @@ const callApi = async (api, parameters) => {
     url: `https://api.todoist.com/api/v1/${api}`,
     data: parameters,
   });
-  return response.data;
+  const data = response.data;
+  const counts = Object.entries(data)
+    .filter(([, v]) => Array.isArray(v))
+    .map(([k, v]) => `${k}: ${v.length}`)
+    .join(", ");
+  logger.info(`[sync] ${counts}`);
+  return data;
 };
 
 const callRestApi = async (path, token, params = {}) => {
@@ -193,15 +199,16 @@ const convertUserNames = (syncData) => {
   }));
 };
 
-const fetchCompleted = async function (token, cursor = null) {
+const fetchCompleted = async function (token, offset = 0) {
   let page;
   try {
-    const params = { limit: COMPL_MAX_PAGE_SIZE };
-    if (cursor) params.cursor = cursor;
-
-    page = await callRestApi("tasks/completed", token, params);
+    page = await callRestApi("tasks/completed", token, {
+      limit: COMPL_MAX_PAGE_SIZE,
+      offset: offset,
+    });
   } catch (error) {
     if (error.response) {
+      logger.warn(`[completed] API error at offset ${offset}: ${error.response.status} ${error.response.statusText}`);
       logger.error({
         status: error.response.status,
         statusText: error.response.statusText,
@@ -209,18 +216,23 @@ const fetchCompleted = async function (token, cursor = null) {
         data: error.response.data,
       });
     } else {
+      logger.warn(`[completed] Request failed at offset ${offset}`);
       logger.error(error);
     }
-    return { results: [] };
+    return { items: [], projects: {}, sections: {} };
   }
 
-  if (page.next_cursor) {
-    const remainder = await fetchCompleted(token, page.next_cursor);
+  logger.info(`[completed] offset=${offset} → ${page.items.length} items`);
+
+  if (page.items.length > 0) {
+    const remainder = await fetchCompleted(token, offset + COMPL_MAX_PAGE_SIZE);
     return {
-      results: (page.results || []).concat(remainder.results),
+      items: page.items.concat(remainder.items),
+      projects: Object.assign({}, page.projects, remainder.projects),
+      sections: Object.assign({}, page.sections, remainder.sections),
     };
   } else {
-    return { results: page.results || [] };
+    return page;
   }
 };
 
@@ -245,15 +257,18 @@ const exportData = async (res, token, format = "csv") => {
     }
     format = format.replace(FORMAT_SUFFIX_INCLUDE_ARCHIVED, "");
     const completedData = await fetchCompleted(token);
-    // Merge completed tasks into items so they appear in CSV and JSON exports
-    syncData.completed = completedData; // keep for JSON export
-    syncData.items = syncData.items.concat(completedData.results || []);
+    logger.info(`[completed] total fetched: ${(completedData.items || []).length} items`);
+    syncData.completed = completedData;
   }
 
   if (format === "json") {
     res.attachment("todoist.json");
     await res.json(syncData);
   } else if (format === "csv") {
+    if (syncData.completed) {
+      syncData.items = syncData.items.concat(syncData.completed.items || []);
+      logger.info(`[export] total items after merge (active + completed): ${syncData.items.length}`);
+    }
     syncData.items = convertProjectNames(syncData);
     syncData.items = convertUserNames(syncData);
     syncData.items = escapeCommas(syncData);
